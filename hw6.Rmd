@@ -1,0 +1,207 @@
+---
+title: "Differentially Expressed Gene"
+author: "Narad Mishra"
+date: "November 28, 2017"
+output: html_document
+---
+
+```{r, warning=FALSE, message=FALSE}
+source("https://bioconductor.org/biocLite.R")
+#biocLite("ALL")
+library(ALL)
+#biocLite("limma")
+library(limma)
+#biocLite("Biobase")
+library(Biobase)
+library(DT)
+data(ALL)
+pd<-pData(ALL)
+#limma disallows special characters i nfactor names
+
+#convenient wrapper to make names compatible with R internals
+mol.biol<-make.names(pd$mol.biol)
+groups<-factor(mol.biol, levels = unique(mol.biol))
+design<-model.matrix(~0 + groups)   #multifactorial design matrix
+datatable(design)
+
+#defining what to compare
+#contrast<-makeContrasts(BCR.ABLvsNEG = BCR.ABL - NEG, levels = design)
+contrast<-makeContrasts(groupsBCR.ABLvsgroupsNEG = groupsBCR.ABL - groupsNEG, levels =design)
+
+
+#normalizing gene expression before differential expression
+M<-normalizeQuantiles(exprs(ALL))
+fit<-lmFit(M, design)
+fit.c<-contrasts.fit(fit, contrast)
+fit.c<-eBayes(fit.c)
+
+#all results of differential expression analysis
+tt<-topTable(fit.c, number=Inf, coef = "groupsBCR.ABLvsgroupsNEG", adjust.method="none", p.value = 0.05)
+
+```
+
+1. Write a function that takes a vector of signiffcantly differentially expressed probes and annotate them by chromosomes they are located on. To do this, you mightfind the "get" function useful. For example: get(paste("hgu95av2", "CHRLOC", sep="")) returns the CHRLOC map for the hgu95av2 annotation package, assuming it has been loaded already by library().
+
+```{r, message=FALSE, warning=FALSE}
+probe<-data.frame(cbind(row.names(tt), tt$P.Value))
+colnames(probe)<-c("probe_id",  "pvalue")
+
+source("https://bioconductor.org/biocLite.R")
+#biocLite("hgu95av2.db")
+library(hgu95av2.db)
+library(dplyr)
+ALL@annotation # Check which microarray platform was used. Or, annotattion(ALL)
+
+xx <- as.list(hgu95av2SYMBOL) # Get full mapping table for probes to gene names
+gene <- unlist(xx[row.names(tt)])
+probe$gene<-gene
+
+sys<-toTable(hgu95av2CHR)
+chrnumber<-inner_join(probe, sys, by="probe_id")
+chrnumber
+
+```
+
+
+2. Use Fisher's Exact test to test whether any chromosomes are significantly enriched or depleted for differentially expressed genes.
+
+```{r, message=FALSE, warning=FALSE}
+library(data.table)
+#frequency of each chromosome in the sample significantly differentially expressed probes
+difexp<-count(chrnumber, chromosome)
+
+#frequency of each chromosome in the entire sample of hgu95av2CHR
+mat1<-count(sys, chromosome)
+
+mat.con<-cbind(difexp,mat1)
+mat.con<-mat.con[,2:4]
+colnames(mat.con)<-c("diffinchr", "chromosome", "inchromo")
+
+mat.con$diffinchr<-as.numeric(mat.con$diffinchr) 
+mat.con$inchromo<-as.numeric(mat.con$inchromo)
+
+#sum of freqency of all the chromosome in sample data and hgu95av2; (785 & 11475)
+mat.con$difex_notinchr<-(785-mat.con$diffinchr)
+mat.con$notinchr<-(11475-mat.con$inchromo)
+
+mat.con<-mat.con[,c("chromosome", "diffinchr","difex_notinchr", "inchromo", "notinchr")]
+
+mat.con <- data.table(mat.con)
+
+mat.con[, p.val := fisher.test(matrix(c(diffinchr, difex_notinchr, inchromo, notinchr), ncol=2),workspace = 1e9)$p.value, by=chromosome]
+
+mat.con[, estimate := fisher.test(matrix(c(diffinchr, difex_notinchr, inchromo, notinchr), ncol=2),workspace = 1e9)$estimate, by=chromosome]
+
+df <- as.data.frame(mat.con)
+head(df)
+
+enriched<-which(df$estimate>1)
+depletes<-which(df$estimate<1)
+
+# The list of chromosome that are enrichmed based on odds ratio greater than one.
+enriched
+depletes
+
+
+```
+
+
+3. Correct for Fisher's exact p-values for multiple testing using all methods you know.
+
+```{r warning=FALSE, message=FALSE}
+library(stats)
+df$bonferroni<-p.adjust(df$p.val, method="bonferroni")
+
+df$holm<-p.adjust(df$p.val, method="holm")
+
+df$hochberg<-p.adjust(df$p.val, method="hochberg")
+
+df$fdr<-p.adjust(df$p.val, method="fdr") 
+
+df$BH<-p.adjust(df$p.val, method="BH")
+
+
+```
+
+
+
+4. Repeat the same calculations using hypergeometric test, binomial test, permutation test. You may ???nd this presentation helpful: http://jura.wi.mit.edu/bio/education/hot_topics/enrichment/Gene_list_ enrichment_Mar10.pdf. Do not adjust for multiple testing.
+
+```{r}
+
+#Binomial test
+binom.mat<-mat.con
+binom.mat$total<-(binom.mat$notinchr + binom.mat$inchromo)
+colnames(binom.mat)
+
+binom.mat$notinchr<-NULL
+binom.mat$p.val<-NULL
+binom.mat$estimate<-NULL
+
+
+binom.mat<-data.frame(binom.mat)
+bt <- function(a, b, c,d) {binom.test(a, b, p=c/d, alternative=
+                            c("two.sided"))$p.value
+  }
+binom.mat$pVal <- mapply(bt, binom.mat$diffinchr, binom.mat$difex_notinchr,  binom.mat$inchromo, binom.mat$total)
+head(binom.mat)
+
+
+#hypergeometric test
+hyperdf<-binom.mat
+hyperdf$total_enriched<-(hyperdf$diffinchr + hyperdf$difex_notinchr)
+hyperdf$difex_notinchr<-NULL
+hyperdf$pVal<-NULL
+hyperdf<-hyperdf[,c("chromosome", "diffinchr", "inchromo", "total", "total_enriched")]
+
+hyperdf$diffinchr<-hyperdf$diffinchr-1
+
+hypstat<-function(bb){
+H<-min(1 - cumsum(dhyper(0:as.numeric(bb[2]), as.numeric(bb[3]), as.numeric(bb[4]), as.numeric(bb[5]))))
+  
+}
+hyperdf$pvalue<-apply(hyperdf,1,hypstat)
+
+#permutation test
+#library(perm)
+#enrichment.tests<-function(chromosome,n=nrow(chrnumber),data=chrnumber,method){
+ # sig.probes<-(data$adjpvalue<0.05)*1
+ # is.in.chromosome<-(data$Chromosome==chromosome)*1
+ # tbl<-t(table(is.in.chromosome,sig.probes))
+ # mat<-matrix(c(tbl[4],tbl[3],tbl[2],tbl[1]),nrow=2)
+  
+#test<- permTS(data$adjPValue~is.in.chromosome,alternative="two.sided",exact=TRUE)$p.value
+  
+#  return(test)
+#}
+
+#chromosome<-c(1:22,"X","Y")
+#permut_pval=sapply(chromosome,function(x)enrichment.tests(chrnumber,method="permutation"))
+
+
+```
+
+5. Summarize the results in one table. Rows are chromosomes, columns are p-values. Column names should similar to "Fisher's exact p-value", "Fisher's exact Bonferroni adjusted", "Fisher's exact FDR adjusted", "...", "hypergeometric p-value", "binomial p-value", "permutation p-value". 
+
+```{r}
+#data df from fisher test
+df<-df[,c("chromosome","p.val", "bonferroni", "holm", "hochberg", "fdr", "BH")]
+#data binom.mat from binomial test
+df$binom_pvalue<-binom.mat$pVal
+#hyperdf from hypergeometric
+df$hyper_pvalue<-hyperdf$pvalue
+colnames(df)<-c("chromosome", "Fisher.p.value", "Fisher.Bonferroni.adjust",
+                "fisher.holm.adjust","fisher.hochberg.adjust","fisher.fdr.adjust",
+                "fisher.BH.adjusted", "binom.pvalue","hyper.pvalue")
+
+df
+```
+
+
+6. Interpret the differences in raw p-values from different tests. 
+
+* The p-values from the binomial and the fisher's exact were pretty similar. However, the p-values for the few chromosomes for the hypergeometric were sparkly different compared to the other tests. The hypergeometric test (according to the slides) is shown to only look for the enriched ones whereas the other tests look for both enriched and depleted.
+
+7. Interpret the differences among different methods for adjustment for multiple testing.
+
+* Looking at the different adjusted p-values, BH-adjusted and fdr-adjusted are exactly the same and I am much surprised by seeing the p-values for adjusted holm, bonferroni, and hochberg, that almost all the p-values are 1. They seems to be much more conservatives compared to fdr-adjusted and other pvalue obtained from different tests. 
